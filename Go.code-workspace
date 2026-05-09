@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"go.toolsEnvVars": {
+			"GOWORK": "/var/home/xerduntis/Dev/Nexus Mods/Retro Rewind/Go/go.work"
+		}
+	}
+}
