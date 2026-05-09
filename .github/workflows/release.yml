@@ -7,26 +7,31 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: linux
             arch: amd64
-            ext: ""
+            artifact: RandoMovie-linux-amd64
           - os: windows-latest
             target: windows
             arch: amd64
-            ext: ".exe"
-          - os: macos-latest
+            artifact: RandoMovie-windows-amd64
+          - os: macos-13
             target: darwin
             arch: amd64
-            ext: ".app"
+            artifact: RandoMovie-macos-intel
           - os: macos-latest
             target: darwin
             arch: arm64
-            ext: ".app"
+            artifact: RandoMovie-macos-apple-silicon
 
     runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        working-directory: ./RandoMovie
 
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +39,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache-dependency-path: RandoMovie/go.sum
 
       - name: Install Fyne dependencies (Linux)
         if: matrix.target == 'linux'
@@ -41,19 +47,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
 
-      - name: Install fyne tool
+      - name: Install fyne CLI
         run: go install fyne.io/fyne/v2/cmd/fyne@latest
 
       - name: Build
-        run: fyne package -os ${{ matrix.target }} -release
+        run: fyne package -os ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RandoMovie-${{ matrix.target }}-${{ matrix.arch }}
+          name: ${{ matrix.artifact }}
           path: |
-            RandoMovie${{ matrix.ext }}
-            RandoMovie
+            RandoMovie/*.exe
+            RandoMovie/*.app
+            RandoMovie/*.tar.xz
+            RandoMovie/RandoMovie
 
   release:
     needs: build
