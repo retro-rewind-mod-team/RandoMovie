@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -26,6 +27,7 @@ type RandoApp struct {
 	cfg     *config.Config
 	backup  *backup.State
 	swapper *swap.Swapper
+	busy    bool
 
 	selectedCat     string
 	selectedPoolIdx int
@@ -41,6 +43,14 @@ type RandoApp struct {
 	restoreBtn    *widget.Button
 	poolList      *widget.List
 	statusBar     *widget.Label
+
+	// Action buttons — disabled while a background operation is running
+	detectBtn     *widget.Button
+	browseBtn     *widget.Button
+	enterPathBtn  *widget.Button
+	randomBtn     *widget.Button
+	restoreAllBtn *widget.Button
+	verifyBtn     *widget.Button
 }
 
 // ─── Main ────────────────────────────────────────────────────
@@ -64,12 +74,16 @@ func (ra *RandoApp) buildUI() {
 
 	// ── Top: Path bar ──
 	ra.pathLabel = widget.NewLabel("Searching…")
+	ra.detectBtn = widget.NewButton("Auto-Detect", func() { ra.autoDetect() })
+	ra.browseBtn = widget.NewButton("Browse…", func() { ra.browsePath() })
+	ra.enterPathBtn = widget.NewButton("Enter Path…", func() { ra.enterPath() })
 	pathBar := container.NewHBox(
 		widget.NewLabelWithStyle("Game:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		ra.pathLabel,
 		layout.NewSpacer(),
-		widget.NewButton("Auto-Detect", func() { ra.autoDetect() }),
-		widget.NewButton("Browse…", func() { ra.browsePath() }),
+		ra.detectBtn,
+		ra.browseBtn,
+		ra.enterPathBtn,
 	)
 
 	// ── Left: Category list ──
@@ -145,6 +159,7 @@ func (ra *RandoApp) buildUI() {
 		widget.NewLabelWithStyle("Video Pool (for Random)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		layout.NewSpacer(),
 		widget.NewButton("+ Add", func() { ra.addVideo() }),
+		widget.NewButton("+ Enter path…", func() { ra.enterVideoPath() }),
 		widget.NewButton("− Remove", func() { ra.removeVideo() }),
 	)
 
@@ -160,10 +175,13 @@ func (ra *RandoApp) buildUI() {
 
 	// ── Bottom: Action bar ──
 	ra.statusBar = widget.NewLabel("Ready")
+	ra.randomBtn = widget.NewButton("🎲 Random All", func() { ra.randomAll() })
+	ra.restoreAllBtn = widget.NewButton("↩ Restore All", func() { ra.restoreAll() })
+	ra.verifyBtn = widget.NewButton("✓ Verify", func() { ra.verifyBackups() })
 	actionBar := container.NewHBox(
-		widget.NewButton("🎲 Random All", func() { ra.randomAll() }),
-		widget.NewButton("↩ Restore All", func() { ra.restoreAll() }),
-		widget.NewButton("✓ Verify", func() { ra.verifyBackups() }),
+		ra.randomBtn,
+		ra.restoreAllBtn,
+		ra.verifyBtn,
 		layout.NewSpacer(),
 		ra.statusBar,
 	)
@@ -174,28 +192,51 @@ func (ra *RandoApp) buildUI() {
 	)
 }
 
+// ─── Busy state ──────────────────────────────────────────────
+
+// setBusy disables all action buttons while a background operation runs
+// (prevents concurrent file I/O on large files) and re-enables them after.
+func (ra *RandoApp) setBusy(b bool) {
+	ra.busy = b
+	for _, btn := range []*widget.Button{
+		ra.detectBtn, ra.browseBtn, ra.enterPathBtn,
+		ra.randomBtn, ra.restoreAllBtn, ra.verifyBtn,
+		ra.swapBtn, ra.restoreBtn,
+	} {
+		if b {
+			btn.Disable()
+		} else {
+			btn.Enable()
+		}
+	}
+	if !b {
+		ra.updateDetail() // re-syncs swapBtn/restoreBtn based on actual state
+	}
+}
+
 // ─── Initialization ──────────────────────────────────────────
 
 func (ra *RandoApp) initGamePath() {
-	// 1. Use saved path from config if it still passes validation.
 	if ra.cfg.GamePath != "" {
 		if err := steam.ValidateGamePath(ra.cfg.GamePath); err == nil {
 			ra.setGamePath(ra.cfg.GamePath)
 			return
 		}
 	}
-	// 2. Fall back to Steam auto-detection.
 	ra.autoDetect()
 }
 
 func (ra *RandoApp) autoDetect() {
+	if ra.busy {
+		return
+	}
 	path, err := steam.FindRetroRewind()
 	if err != nil {
-		ra.pathLabel.SetText("Not found — use Browse")
+		ra.pathLabel.SetText("Not found — use Browse or Enter Path")
 		ra.statusBar.SetText("Auto-detection failed")
 		dialog.ShowInformation("Not Found",
 			"RetroRewind could not be found automatically.\n"+
-				"Please select the game folder manually.",
+				"Please select the game folder via Browse or Enter Path.",
 			ra.window,
 		)
 		return
@@ -204,6 +245,9 @@ func (ra *RandoApp) autoDetect() {
 }
 
 func (ra *RandoApp) browsePath() {
+	if ra.busy {
+		return
+	}
 	d := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
 		if err != nil || uri == nil {
 			return
@@ -221,30 +265,81 @@ func (ra *RandoApp) browsePath() {
 	d.Show()
 }
 
+// enterPath opens a text-entry dialog so the user can type or paste a game
+// path that the file browser cannot reach, such as UNC network shares.
+func (ra *RandoApp) enterPath() {
+	if ra.busy {
+		return
+	}
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder(`e.g. Z:\Games\RetroRewind  or  \\NAS\Games\RetroRewind`)
+	if ra.cfg.GamePath != "" {
+		entry.SetText(ra.cfg.GamePath)
+	}
+	d := dialog.NewCustomConfirm("Enter Game Path", "Set", "Cancel", entry, func(ok bool) {
+		if !ok {
+			return
+		}
+		path := strings.TrimSpace(entry.Text)
+		if path == "" {
+			return
+		}
+		if err := steam.ValidateGamePath(path); err != nil {
+			dialog.ShowError(fmt.Errorf("invalid game directory:\n%s", err), ra.window)
+			return
+		}
+		ra.setGamePath(path)
+	}, ra.window)
+	d.Show()
+}
+
+// enterVideoPath lets the user type or paste a video file path for the pool,
+// useful when the file lives on a network share not reachable via the file browser.
+func (ra *RandoApp) enterVideoPath() {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder(`e.g. Z:\Videos\myfilm.mp4  or  \\NAS\Videos\myfilm.mp4`)
+	d := dialog.NewCustomConfirm("Enter Video Path", "Add", "Cancel", entry, func(ok bool) {
+		if !ok {
+			return
+		}
+		path := strings.TrimSpace(entry.Text)
+		if path == "" {
+			return
+		}
+		ra.cfg.AddVideo(path)
+		ra.cfg.Save()
+		ra.poolList.Refresh()
+		ra.statusBar.SetText(fmt.Sprintf("Added %s to pool", filepath.Base(path)))
+	}, ra.window)
+	d.Show()
+}
+
 func (ra *RandoApp) setGamePath(path string) {
 	ra.cfg.GamePath = path
 	ra.cfg.Save()
 
-	// Pfad-Anzeige kürzen
 	display := path
 	if len(display) > 50 {
 		display = "…" + display[len(display)-47:]
 	}
 	ra.pathLabel.SetText(display)
 
-	// Backup-System initialisieren
 	ra.backup = backup.NewState(path)
-	count, errs := ra.backup.BackupAll()
 	ra.swapper = swap.New(path, ra.backup)
 
-	if len(errs) > 0 {
-		ra.statusBar.SetText(fmt.Sprintf("Backed up %d (%d errors)", count, len(errs)))
-	} else {
-		ra.statusBar.SetText(fmt.Sprintf("Ready — %d categories backed up", count))
-	}
+	ra.statusBar.SetText("Creating backups…")
+	ra.setBusy(true)
 
-	ra.catList.Refresh()
-	ra.updateDetail()
+	go func() {
+		count, errs := ra.backup.BackupAll()
+		if len(errs) > 0 {
+			ra.statusBar.SetText(fmt.Sprintf("Backed up %d (%d errors)", count, len(errs)))
+		} else {
+			ra.statusBar.SetText(fmt.Sprintf("Ready — %d categories backed up", count))
+		}
+		ra.setBusy(false)
+		ra.catList.Refresh()
+	}()
 }
 
 // ─── Detail Panel ────────────────────────────────────────────
@@ -261,7 +356,9 @@ func (ra *RandoApp) updateDetail() {
 	}
 
 	ra.detailTitle.SetText("📂 " + ra.selectedCat)
-	ra.swapBtn.Enable()
+	if !ra.busy {
+		ra.swapBtn.Enable()
+	}
 
 	info, exists := ra.backup.Categories[ra.selectedCat]
 	if !exists {
@@ -277,7 +374,9 @@ func (ra *RandoApp) updateDetail() {
 		ra.restoreBtn.Disable()
 	} else {
 		ra.statusLabel.SetText("Status: Modified 🔶")
-		ra.restoreBtn.Enable()
+		if !ra.busy {
+			ra.restoreBtn.Enable()
+		}
 	}
 
 	ra.origHashLabel.SetText("Original: " + info.OriginalHash[:16] + "…")
@@ -287,7 +386,7 @@ func (ra *RandoApp) updateDetail() {
 // ─── Category Actions ────────────────────────────────────────
 
 func (ra *RandoApp) swapSelected() {
-	if ra.selectedCat == "" || ra.swapper == nil {
+	if ra.selectedCat == "" || ra.swapper == nil || ra.busy {
 		return
 	}
 	cat := ra.selectedCat
@@ -299,38 +398,46 @@ func (ra *RandoApp) swapSelected() {
 		videoPath := reader.URI().Path()
 		reader.Close()
 
-		if err := ra.swapper.SwapVideo(cat, videoPath); err != nil {
-			dialog.ShowError(err, ra.window)
-			return
-		}
-
-		ra.statusBar.SetText(fmt.Sprintf(
-			"Swapped %s ← %s", cat, filepath.Base(videoPath),
-		))
-		ra.catList.Refresh()
-		ra.updateDetail()
+		ra.statusBar.SetText(fmt.Sprintf("Swapping %s…", cat))
+		ra.setBusy(true)
+		go func() {
+			swapErr := ra.swapper.SwapVideo(cat, videoPath)
+			if swapErr != nil {
+				dialog.ShowError(swapErr, ra.window)
+			} else {
+				ra.statusBar.SetText(fmt.Sprintf("Swapped %s ← %s", cat, filepath.Base(videoPath)))
+				ra.catList.Refresh()
+			}
+			ra.setBusy(false)
+		}()
 	}, ra.window)
 	d.SetFilter(storage.NewExtensionFileFilter([]string{".mp4"}))
 	d.Show()
 }
 
 func (ra *RandoApp) restoreSelected() {
-	if ra.selectedCat == "" || ra.backup == nil {
+	if ra.selectedCat == "" || ra.backup == nil || ra.busy {
 		return
 	}
-	if err := ra.backup.Restore(ra.selectedCat); err != nil {
-		dialog.ShowError(err, ra.window)
-		return
-	}
-	ra.statusBar.SetText(fmt.Sprintf("Restored %s ✅", ra.selectedCat))
-	ra.catList.Refresh()
-	ra.updateDetail()
+	cat := ra.selectedCat
+	ra.statusBar.SetText(fmt.Sprintf("Restoring %s…", cat))
+	ra.setBusy(true)
+	go func() {
+		restoreErr := ra.backup.Restore(cat)
+		if restoreErr != nil {
+			dialog.ShowError(restoreErr, ra.window)
+		} else {
+			ra.statusBar.SetText(fmt.Sprintf("Restored %s ✅", cat))
+			ra.catList.Refresh()
+		}
+		ra.setBusy(false)
+	}()
 }
 
 // ─── Global Actions ──────────────────────────────────────────
 
 func (ra *RandoApp) randomAll() {
-	if ra.swapper == nil {
+	if ra.swapper == nil || ra.busy {
 		return
 	}
 	if len(ra.cfg.VideoPool) == 0 {
@@ -341,19 +448,22 @@ func (ra *RandoApp) randomAll() {
 		return
 	}
 
-	assignments, err := ra.swapper.RandomSwap(steam.Categories, ra.cfg.VideoPool)
-	if err != nil {
-		dialog.ShowError(err, ra.window)
-		return
-	}
-
-	ra.statusBar.SetText(fmt.Sprintf("🎲 Randomly assigned %d videos", len(assignments)))
-	ra.catList.Refresh()
-	ra.updateDetail()
+	ra.statusBar.SetText("Randomising…")
+	ra.setBusy(true)
+	go func() {
+		assignments, randErr := ra.swapper.RandomSwap(steam.Categories, ra.cfg.VideoPool)
+		if randErr != nil {
+			dialog.ShowError(randErr, ra.window)
+		} else {
+			ra.statusBar.SetText(fmt.Sprintf("🎲 Randomly assigned %d videos", len(assignments)))
+			ra.catList.Refresh()
+		}
+		ra.setBusy(false)
+	}()
 }
 
 func (ra *RandoApp) restoreAll() {
-	if ra.backup == nil {
+	if ra.backup == nil || ra.busy {
 		return
 	}
 	dialog.ShowConfirm("Restore All",
@@ -362,45 +472,52 @@ func (ra *RandoApp) restoreAll() {
 			if !ok {
 				return
 			}
-			count, errs := ra.backup.RestoreAll()
-			if len(errs) > 0 {
-				ra.statusBar.SetText(fmt.Sprintf(
-					"Restored %d (%d errors)", count, len(errs),
-				))
-			} else {
-				ra.statusBar.SetText(fmt.Sprintf("Restored %d categories ✅", count))
-			}
-			ra.catList.Refresh()
-			ra.updateDetail()
+			ra.statusBar.SetText("Restoring all…")
+			ra.setBusy(true)
+			go func() {
+				count, errs := ra.backup.RestoreAll()
+				if len(errs) > 0 {
+					ra.statusBar.SetText(fmt.Sprintf("Restored %d (%d errors)", count, len(errs)))
+				} else {
+					ra.statusBar.SetText(fmt.Sprintf("Restored %d categories ✅", count))
+				}
+				ra.setBusy(false)
+				ra.catList.Refresh()
+			}()
 		}, ra.window,
 	)
 }
 
 func (ra *RandoApp) verifyBackups() {
-	if ra.backup == nil {
+	if ra.backup == nil || ra.busy {
 		return
 	}
-	results := ra.backup.VerifyBackups()
-	ok, bad := 0, 0
-	for _, valid := range results {
-		if valid {
-			ok++
-		} else {
-			bad++
+	ra.statusBar.SetText("Verifying…")
+	ra.setBusy(true)
+	go func() {
+		results := ra.backup.VerifyBackups()
+		ok, bad := 0, 0
+		for _, valid := range results {
+			if valid {
+				ok++
+			} else {
+				bad++
+			}
 		}
-	}
-	if bad == 0 {
-		dialog.ShowInformation("Verification",
-			fmt.Sprintf("All %d backups intact ✅", ok),
-			ra.window,
-		)
-	} else {
-		dialog.ShowError(
-			fmt.Errorf("%d OK, %d corrupted ⚠️", ok, bad),
-			ra.window,
-		)
-	}
-	ra.statusBar.SetText(fmt.Sprintf("Verified: %d OK, %d bad", ok, bad))
+		if bad == 0 {
+			dialog.ShowInformation("Verification",
+				fmt.Sprintf("All %d backups intact ✅", ok),
+				ra.window,
+			)
+		} else {
+			dialog.ShowError(
+				fmt.Errorf("%d OK, %d corrupted ⚠️", ok, bad),
+				ra.window,
+			)
+		}
+		ra.statusBar.SetText(fmt.Sprintf("Verified: %d OK, %d bad", ok, bad))
+		ra.setBusy(false)
+	}()
 }
 
 // ─── Video Pool ──────────────────────────────────────────────
