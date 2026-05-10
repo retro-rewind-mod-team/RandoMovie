@@ -18,7 +18,7 @@ jobs:
             target: windows
             arch: amd64
             artifact: RandoMovie-windows-amd64
-          - os: macos-13
+          - os: macos-15-intel
             target: darwin
             arch: amd64
             artifact: RandoMovie-macos-intel
