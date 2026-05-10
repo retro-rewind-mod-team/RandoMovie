@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     strategy:
@@ -55,15 +58,22 @@ jobs:
           CGO_ENABLED: 1
         run: fyne package -os ${{ matrix.target }}
 
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "darwin" ]; then
+            zip -r "${{ matrix.artifact }}.zip" RandoMovie.app
+          elif [ "${{ matrix.target }}" = "windows" ]; then
+            mv RandoMovie.exe "${{ matrix.artifact }}.exe"
+          elif [ "${{ matrix.target }}" = "linux" ]; then
+            mv RandoMovie.tar.xz "${{ matrix.artifact }}.tar.xz"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            RandoMovie/*.exe
-            RandoMovie/*.app
-            RandoMovie/*.tar.xz
-            RandoMovie/RandoMovie
+          path: RandoMovie/${{ matrix.artifact }}.*
 
   release:
     needs: build
